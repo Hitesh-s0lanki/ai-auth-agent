@@ -2,6 +2,41 @@ This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-
 
 ## Getting Started
 
+### Database Setup
+
+This project uses Drizzle ORM with PostgreSQL. Follow these steps to set up the database:
+
+1. **Install dependencies:**
+   ```bash
+   npm install
+   ```
+
+2. **Set up your database:**
+   - Create a PostgreSQL database (locally or using a service like Supabase, Neon, etc.)
+   - Add your database connection string to a `.env.local` file:
+     ```
+     DATABASE_URL=postgresql://user:password@localhost:5432/ai-auth-agent
+     ```
+
+3. **Run migrations:**
+   ```bash
+   # Generate migration files
+   npm run db:generate
+   
+   # Apply migrations to your database
+   npm run db:migrate
+   
+   # Or use push for development (auto-syncs schema)
+   npm run db:push
+   ```
+
+4. **Optional: Open Drizzle Studio (database GUI):**
+   ```bash
+   npm run db:studio
+   ```
+
+### Development Server
+
 First, run the development server:
 
 ```bash
