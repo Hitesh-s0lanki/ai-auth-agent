@@ -314,18 +314,24 @@ export async function POST(
       );
     }
 
+    const bodyObj = body as ChatRequestPayload;
     const query = extractQueryFromBody(body);
-    if (!query) {
+    const frontendToolCallRes = bodyObj?.frontendToolCallRes ?? null;
+
+    // Allow empty query if frontendToolCallRes is provided (tool result continuation)
+    if (!query && !frontendToolCallRes) {
       return Response.json(
-        { error: "query/text/messages required (non-empty string)" },
+        {
+          error:
+            "query/text/messages required (non-empty string) or frontendToolCallRes must be provided",
+        },
         { status: 400 }
       );
     }
 
-    const bodyObj = body as ChatRequestPayload;
     const validatedBody: ChatRequestBody = {
-      query,
-      frontendToolCallRes: bodyObj?.frontendToolCallRes ?? null,
+      query: query || "", // Use empty string if no query but tool result exists
+      frontendToolCallRes,
     };
 
     const cookieStore = await cookies();
@@ -361,19 +367,22 @@ export async function POST(
       (m) => m.role === "user"
     ).length;
 
-    // Save user message BEFORE starting the stream so it's available immediately
-    const saveUser = await saveMessage(
-      chatId,
-      "user",
-      validatedBody.query,
-      [{ type: "text", text: validatedBody.query }],
-      null
-    );
-    if (!saveUser.success) {
-      return Response.json(
-        { error: saveUser.error || "Failed to save user message" },
-        { status: 500 }
+    // Save user message ONLY if query exists (not for tool result only requests)
+    let saveUser: Awaited<ReturnType<typeof saveMessage>> | null = null;
+    if (validatedBody.query && validatedBody.query.trim()) {
+      saveUser = await saveMessage(
+        chatId,
+        "user",
+        validatedBody.query,
+        [{ type: "text", text: validatedBody.query }],
+        null
       );
+      if (!saveUser.success) {
+        return Response.json(
+          { error: saveUser.error || "Failed to save user message" },
+          { status: 500 }
+        );
+      }
     }
 
     // Convert database messages to AI SDK format
@@ -385,15 +394,18 @@ export async function POST(
       }))
     );
 
-    // Inject authentication alert for unauthenticated users after 2 messages
-    // This alerts the AI agent that the user is not authenticated
-    let user_query = validatedBody.query;
-    if (existingUserCount > 2 && !userId) {
-      user_query +=
-        "\n\n<<<<<====== Alert =======>>>>>>>>>\nUser is not Authenticated\n<<<<<====== Alert =======>>>>>>>>>";
-    }
+    // Inject user message only if query exists
+    if (validatedBody.query && validatedBody.query.trim()) {
+      // Inject authentication alert for unauthenticated users after 2 messages
+      // This alerts the AI agent that the user is not authenticated
+      let user_query = validatedBody.query;
+      if (existingUserCount > 2 && !userId) {
+        user_query +=
+          "\n\n<<<<<====== Alert =======>>>>>>>>>\nUser is not Authenticated\n<<<<<====== Alert =======>>>>>>>>>";
+      }
 
-    agentMessages.push({ role: "user", content: user_query });
+      agentMessages.push({ role: "user", content: user_query });
+    }
 
     // Inject tool call result from frontend if provided
     // This allows the AI to continue the conversation after a tool call
@@ -434,18 +446,43 @@ export async function POST(
        * Saves the assistant message, tool calls, and generates chat title if needed.
        */
       onFinish: async ({ text, steps }) => {
-        // User message was already saved before stream started for immediate availability
-        // Now save the assistant's response
+        // Get the parent message ID (user message if exists, otherwise null for tool-only requests)
+        const parentMessageId =
+          saveUser && saveUser.success ? saveUser.data.id : null;
+
+        // Save the assistant's response
         const saveAssistant = await saveMessage(
           chatId,
           "assistant",
           text,
           [{ type: "text", text }],
-          saveUser.data.id
+          parentMessageId
         );
         if (!saveAssistant.success) throw new Error(saveAssistant.error);
 
-        // Save all tool calls that were executed during the conversation
+        // Save frontend tool call result to database if provided
+        if (validatedBody.frontendToolCallRes) {
+          const toolResult = validatedBody.frontendToolCallRes;
+          const createdAtForFrontendTool = new Date();
+
+          try {
+            await createToolCall(
+              saveAssistant.data.id,
+              toolResult.toolCallId,
+              toolResult.toolName,
+              {}, // Frontend tools don't have input args stored separately
+              toolResult.output.type === "json"
+                ? (toolResult.output.value as Record<string, unknown>)
+                : { value: toolResult.output.value },
+              createdAtForFrontendTool
+            );
+          } catch (err) {
+            console.error("Error saving frontend tool call:", err);
+            // Don't throw - continue with other tool calls
+          }
+        }
+
+        // Save all server-side tool calls that were executed during the conversation
         const createdAtForToolCalls = new Date();
         for (const step of steps) {
           for (const item of step.content) {
@@ -467,7 +504,12 @@ export async function POST(
 
         // Generate chat title after the FIRST user message
         // existingUserCount === 0 means this was the first message in the chat
-        if (existingUserCount === 0) {
+        // Only generate if there was a user query (not tool-only request)
+        if (
+          existingUserCount === 0 &&
+          validatedBody.query &&
+          validatedBody.query.trim()
+        ) {
           await generateChatTitleWithAI(
             validatedBody.query,
             chatId,

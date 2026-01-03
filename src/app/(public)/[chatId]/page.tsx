@@ -12,17 +12,23 @@ import type { ChatRequestBody } from "@/modules/chat/types";
 import type { Message } from "@/modules/messages/types";
 import { useUpdateChats } from "@/hooks/use-chats";
 import { Spinner } from "@/components/ui/spinner";
+import {
+  applyStreamingMiddleware,
+  type StreamingMiddleware,
+} from "@/lib/streaming-middleware";
+import { useChatFrontendTools } from "@/hooks/use-chat-frontend-tools";
+import type { ToolResultContentPart } from "@/modules/tools/types";
 
 /**
  * Chat page component - displays and manages an existing chat session.
- * 
+ *
  * Features:
  * - Loads chat history from API
  * - Auto-sends first message from query param (for new chats)
  * - Streams AI responses using useChat hook
  * - Updates chat metadata (lastMessage, updatedAt) in sidebar
  * - Handles tool calls and frontend tool call results
- * 
+ *
  * @returns Chat interface with message history and input
  */
 export default function ChatPage() {
@@ -42,18 +48,244 @@ export default function ChatPage() {
   const lastUpdatedRef = useRef<string>(""); // Tracks last updated message to prevent duplicate updates
   const hasLoadedMessagesRef = useRef(false); // Ensures messages are only loaded once
 
+  // Frontend tools for Clerk authentication
+  const { tools: frontendTools, CaptchaSlot } = useChatFrontendTools();
+
+  // Track pending tool calls to avoid duplicate executions
+  const pendingToolCallsRef = useRef<Set<string>>(new Set());
+  // Track which messages we've already processed for tool calls
+  const processedMessagesRef = useRef<Set<string>>(new Set());
+  const [pendingToolCallRes, setPendingToolCallRes] =
+    useState<ToolResultContentPart | null>(null);
+
   const transport = useMemo(
     () =>
       new AxiosChatTransport({
         api: `/api/chat/${chatId}`,
-        body: () => ({ frontendToolCallRes: null } as Partial<ChatRequestBody>),
+        body: () => ({
+          frontendToolCallRes: pendingToolCallRes,
+        } as Partial<ChatRequestBody>),
       }),
-    [chatId]
+    [chatId, pendingToolCallRes]
   );
 
   const { messages, setMessages, sendMessage, status, stop, error } = useChat({
     transport,
   });
+
+  /**
+   * Define streaming middleware functions
+   * Add your middleware functions here to process streaming text
+   *
+   * Middleware is applied to all streaming text chunks on the client side.
+   * Each middleware function receives:
+   * - text: The current text chunk
+   * - context: { messageId, role, isStreaming, accumulatedText }
+   *
+   * Example usage:
+   * ```ts
+   * import { wordReplacementMiddleware } from "@/lib/middleware-examples";
+   *
+   * const streamingMiddleware: StreamingMiddleware[] = [
+   *   wordReplacementMiddleware,
+   *   // Add more middleware here
+   * ];
+   * ```
+   *
+   * Or define inline:
+   * ```ts
+   * const customMiddleware: StreamingMiddleware = (text, context) => {
+   *   if (context.role === "assistant" && context.isStreaming) {
+   *     // Your transformation logic
+   *     return text.replace(/pattern/g, "replacement");
+   *   }
+   *   return text;
+   * };
+   * ```
+   */
+  const streamingMiddleware: StreamingMiddleware[] = useMemo(() => {
+    // Add your middleware functions here
+    // They will be applied in order to each streaming text chunk
+    //
+    // Example: Import from middleware-examples.ts
+    // import { wordReplacementMiddleware, sanitizeMiddleware } from "@/lib/middleware-examples";
+    // return [wordReplacementMiddleware, sanitizeMiddleware];
+
+    return [
+      // Add your middleware functions here
+      // Example inline middleware:
+      // (text, context) => {
+      //   // Only apply to assistant messages during streaming
+      //   if (context.role === "assistant" && context.isStreaming) {
+      //     // Your transformation logic here
+      //     return text;
+      //   }
+      //   return text;
+      // },
+    ];
+  }, []);
+
+  // Apply middleware to messages before rendering
+  const processedMessages = useMemo(() => {
+    const isStreaming = status === "streaming" || status === "submitted";
+    return applyStreamingMiddleware(messages, streamingMiddleware, isStreaming);
+  }, [messages, streamingMiddleware, status]);
+
+  /**
+   * Handle frontend tool calls from streamed messages
+   * Detects tool calls in structured output and executes them
+   * This runs whenever messages change during streaming
+   */
+  useEffect(() => {
+    // Only process during streaming, not when ready
+    if (!frontendTools || status === "ready" || !messages.length) {
+      return;
+    }
+
+    // Find the last assistant message with structured output
+    const lastAssistantMessage = [...messages]
+      .reverse()
+      .find((msg) => msg.role === "assistant");
+
+    if (!lastAssistantMessage) return;
+
+    // Skip if we've already processed this message
+    if (processedMessagesRef.current.has(lastAssistantMessage.id)) {
+      return;
+    }
+
+    // Check for structured output with frontend_tool_call
+    // TypeScript doesn't recognize "object" as a valid part type, so we use type assertion
+    let foundToolCall = false;
+    for (const part of lastAssistantMessage.parts) {
+      const partRecord = part as Record<string, unknown>;
+      if (
+        typeof part === "object" &&
+        part !== null &&
+        "type" in partRecord &&
+        partRecord.type === "object" &&
+        "object" in partRecord &&
+        typeof partRecord.object === "object" &&
+        partRecord.object !== null
+      ) {
+        const obj = partRecord.object as Record<string, unknown>;
+        const frontendToolCall = obj.frontend_tool_call as
+          | {
+              tool_name: string;
+              tool_args: Record<string, unknown>;
+            }
+          | null
+          | undefined;
+
+        if (frontendToolCall && frontendToolCall.tool_name) {
+          foundToolCall = true;
+          
+          // Create a stable tool call ID based on message and tool name
+          const toolCallId = `frontend-${frontendToolCall.tool_name}-${lastAssistantMessage.id}`;
+
+          // Skip if already processing this tool call
+          if (pendingToolCallsRef.current.has(toolCallId)) {
+            continue;
+          }
+
+          pendingToolCallsRef.current.add(toolCallId);
+
+          // Execute the frontend tool asynchronously
+          const executeTool = async () => {
+            try {
+              const toolName = frontendToolCall.tool_name;
+              const tool = frontendTools[toolName as keyof typeof frontendTools];
+
+              if (!tool || typeof tool !== "object" || !("execute" in tool)) {
+                throw new Error(
+                  `Frontend tool "${toolName}" not found. Available tools: ${Object.keys(frontendTools).join(", ")}`
+                );
+              }
+
+              // Validate and prepare arguments using zod schema if available
+              let toolArgs: unknown = frontendToolCall.tool_args;
+              if (tool.parameters && "parse" in tool.parameters) {
+                try {
+                  toolArgs = tool.parameters.parse(frontendToolCall.tool_args);
+                } catch (parseErr) {
+                  throw new Error(
+                    `Invalid arguments for ${toolName}: ${
+                      parseErr instanceof Error ? parseErr.message : "Validation failed"
+                    }`
+                  );
+                }
+              }
+
+              // Execute the tool
+              const result = await tool.execute(toolArgs as never);
+
+              // Format result for API
+              const toolResult: ToolResultContentPart = {
+                type: "tool-result",
+                toolCallId,
+                toolName,
+                output: {
+                  type: "json",
+                  value: result,
+                },
+              };
+
+              setPendingToolCallRes(toolResult);
+
+              // Automatically continue the conversation by sending a continuation message
+              // This will trigger the API to process the tool result
+              // Use a small delay to ensure state is updated
+              setTimeout(() => {
+                sendMessage({ text: "continue" });
+                // Clear after a delay to ensure it's sent
+                setTimeout(() => {
+                  setPendingToolCallRes(null);
+                  pendingToolCallsRef.current.delete(toolCallId);
+                }, 1000);
+              }, 200);
+            } catch (err) {
+              console.error("Frontend tool execution error:", err);
+
+              // Send error result back to API
+              const errorMessage =
+                err instanceof Error
+                  ? err.message
+                  : "An unknown error occurred while executing the tool";
+
+              const errorResult: ToolResultContentPart = {
+                type: "tool-result",
+                toolCallId,
+                toolName: frontendToolCall.tool_name,
+                output: {
+                  type: "text",
+                  value: `Error: ${errorMessage}`,
+                },
+              };
+
+              setPendingToolCallRes(errorResult);
+
+              // Continue conversation with error
+              setTimeout(() => {
+                sendMessage({ text: "continue" });
+                setTimeout(() => {
+                  setPendingToolCallRes(null);
+                  pendingToolCallsRef.current.delete(toolCallId);
+                }, 1000);
+              }, 200);
+            }
+          };
+
+          // Execute immediately
+          void executeTool();
+        }
+      }
+    }
+
+    // Mark message as processed if we found a tool call or if there's no tool call
+    if (lastAssistantMessage && (foundToolCall || lastAssistantMessage.parts.length > 0)) {
+      processedMessagesRef.current.add(lastAssistantMessage.id);
+    }
+  }, [messages, frontendTools, status, sendMessage]);
 
   /**
    * Load chat message history from API.
@@ -150,13 +382,14 @@ export default function ChatPage() {
   /**
    * Update chat metadata (lastMessage, updatedAt) in sidebar when messages change.
    * Uses deduplication to prevent unnecessary updates.
+   * Note: Uses processedMessages to get the final text after middleware
    */
   useEffect(() => {
     if (!chatId) return;
     if (isInitializingRef.current) return;
-    if (messages.length === 0) return;
+    if (processedMessages.length === 0) return;
 
-    const last = messages[messages.length - 1];
+    const last = processedMessages[processedMessages.length - 1];
     const textPart = last.parts.find((p) => p.type === "text");
     const lastText = textPart && "text" in textPart ? textPart.text : "";
     const key = `${last.id}:${lastText.slice(0, 60)}`;
@@ -172,7 +405,7 @@ export default function ChatPage() {
     }, 150);
 
     return () => clearTimeout(t);
-  }, [chatId, messages, updateChat]);
+  }, [chatId, processedMessages, updateChat]);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -191,8 +424,12 @@ export default function ChatPage() {
         <div className="flex flex-col items-center gap-4">
           <Spinner className="size-8 text-primary" />
           <div className="flex flex-col items-center gap-2">
-            <p className="text-sm font-medium text-foreground">Loading chat...</p>
-            <p className="text-xs text-muted-foreground">Please wait while we fetch your messages</p>
+            <p className="text-sm font-medium text-foreground">
+              Loading chat...
+            </p>
+            <p className="text-xs text-muted-foreground">
+              Please wait while we fetch your messages
+            </p>
           </div>
         </div>
       </div>
@@ -200,14 +437,17 @@ export default function ChatPage() {
   }
 
   return (
-    <ChatContainer
-      messages={messages}
-      input={input}
-      setInput={setInput}
-      onSubmit={handleSubmit}
-      status={status}
-      stop={stop}
-      error={error}
-    />
+    <>
+      <CaptchaSlot />
+      <ChatContainer
+        messages={processedMessages}
+        input={input}
+        setInput={setInput}
+        onSubmit={handleSubmit}
+        status={status}
+        stop={stop}
+        error={error}
+      />
+    </>
   );
 }
