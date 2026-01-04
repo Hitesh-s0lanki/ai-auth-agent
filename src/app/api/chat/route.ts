@@ -5,21 +5,21 @@ import { createChat } from "@/modules/chat/server";
 
 /**
  * POST /api/chat
- * 
+ *
  * Creates a new chat session.
- * 
+ *
  * This endpoint:
  * - Creates a new chat in the database
  * - Supports both authenticated users and anonymous sessions
  * - Optionally accepts a first message to pre-populate the chat
- * 
+ *
  * Authentication:
  * - Requires either authenticated user (userId) or session cookie
  * - If no session cookie exists, one will be created by the middleware
- * 
+ *
  * Request Body:
  * - firstMessage (optional): Initial message to start the chat with
- * 
+ *
  * @param req - Request object containing optional firstMessage
  * @returns JSON response with created chat data (id, title, timestamps)
  */
@@ -86,4 +86,3 @@ export async function POST(req: Request) {
     );
   }
 }
-

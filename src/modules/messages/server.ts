@@ -5,6 +5,7 @@ import { eq, inArray } from "drizzle-orm";
 import { randomUUID } from "crypto";
 import { verifyChatOwnership } from "@/modules/chat/server";
 import { SaveMessageResult, GetChatMessagesResult, Message } from "./types";
+import { generateToolCallId } from "@/lib/tool-call-id";
 
 /**
  * Helper to extract text from message parts
@@ -200,35 +201,38 @@ export async function getChatMessages(
       }>;
 
       if (raw?.parts && Array.isArray(raw.parts)) {
-        // Use parts from raw, ensuring text is included
-        parts = raw.parts.map((part) => {
-          // Handle structured output (object type) - extract only the result field
-          if (
-            part.type === "object" &&
-            typeof part === "object" &&
-            part !== null
-          ) {
-            const objPart = part as { object?: { result?: string } };
-            const resultText = objPart.object?.result;
-            if (resultText) {
-              // Convert structured output to text part with only the result
+        // Filter out duplicate parts: keep only one text part, prefer object over data
+        let seenText = false;
+        const hasObject = raw.parts.some((p) => p.type === "object");
+
+        parts = raw.parts
+          .filter((part) => {
+            // Keep only the first text part
+            if (part.type === "text") {
+              if (seenText) {
+                return false; // Skip duplicate text parts
+              }
+              seenText = true;
+              return true;
+            }
+            // Skip data parts if object part exists (object is preferred)
+            if (part.type === "data" && hasObject) {
+              return false;
+            }
+            // Keep all other parts (object, tool-call, tool-result, etc.)
+            return true;
+          })
+          .map((part) => {
+            // If it's a text part, ensure text is set
+            if (part.type === "text") {
               return {
-                type: "text",
-                text: resultText,
+                ...part,
+                text: part.text || msg.content || "",
               };
             }
-          }
-
-          // If it's a text part, ensure text is set
-          if (part.type === "text") {
-            return {
-              ...part,
-              text: part.text || msg.content || "",
-            };
-          }
-          // For tool parts (tool-call, tool-result), include all properties
-          return part;
-        });
+            // For all other parts, include all properties as-is
+            return part;
+          });
 
         // If no text part exists but we have content, add it
         const hasTextPart = parts.some((p) => p.type === "text");
@@ -265,8 +269,15 @@ export async function getChatMessages(
 
         for (const tool of toolsForMessage) {
           // Generate toolCallId if missing (required by UI)
+          // Must be <= 64 chars for OpenAI API compatibility
           const toolCallId =
-            tool.toolCallId || `tool-${tool.toolName}-${msg.id}-${Date.now()}`;
+            tool.toolCallId ||
+            (() => {
+              const timestamp = Date.now().toString();
+              // Use message ID + timestamp for uniqueness, but keep it short
+              const uniqueId = `${msg.id}-${timestamp}`;
+              return generateToolCallId("tool", tool.toolName, uniqueId);
+            })();
 
           // Only add if not already present (by toolCallId)
           const shouldAdd = !existingToolCallIds.has(toolCallId);
