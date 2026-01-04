@@ -129,18 +129,14 @@ export async function deleteChat(
 
     const chatToDelete = chat[0];
 
-    // Verify ownership
-    if (userId && chatToDelete.userId !== userId) {
-      return {
-        success: false,
-        error: "Unauthorized - chat does not belong to user",
-      };
-    }
+    // Verify ownership - allow if chat belongs to userId OR sessionId
+    const belongsToUser = userId && chatToDelete.userId === userId;
+    const belongsToSession = sessionId && chatToDelete.sessionId === sessionId;
 
-    if (!userId && chatToDelete.sessionId !== sessionId) {
+    if (!belongsToUser && !belongsToSession) {
       return {
         success: false,
-        error: "Unauthorized - chat does not belong to session",
+        error: "Unauthorized - chat does not belong to user or session",
       };
     }
 
@@ -213,18 +209,14 @@ export async function updateChat(
 
     const chatToUpdate = chat[0];
 
-    // Verify ownership
-    if (userId && chatToUpdate.userId !== userId) {
-      return {
-        success: false,
-        error: "Unauthorized - chat does not belong to user",
-      };
-    }
+    // Verify ownership - allow if chat belongs to userId OR sessionId
+    const belongsToUser = userId && chatToUpdate.userId === userId;
+    const belongsToSession = sessionId && chatToUpdate.sessionId === sessionId;
 
-    if (!userId && chatToUpdate.sessionId !== sessionId) {
+    if (!belongsToUser && !belongsToSession) {
       return {
         success: false,
-        error: "Unauthorized - chat does not belong to session",
+        error: "Unauthorized - chat does not belong to user or session",
       };
     }
 
@@ -363,15 +355,11 @@ export async function verifyChatOwnership(
 
     const chatToVerify = chat[0];
 
-    // Verify ownership
-    if (userId && chatToVerify.userId !== userId) {
-      return {
-        success: false,
-        error: "Chat access denied",
-      };
-    }
+    // Verify ownership - allow if chat belongs to userId OR sessionId
+    const belongsToUser = userId && chatToVerify.userId === userId;
+    const belongsToSession = sessionId && chatToVerify.sessionId === sessionId;
 
-    if (!userId && chatToVerify.sessionId !== sessionId) {
+    if (!belongsToUser && !belongsToSession) {
       return {
         success: false,
         error: "Chat access denied",

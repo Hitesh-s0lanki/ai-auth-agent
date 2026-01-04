@@ -12,17 +12,9 @@ export function ChatLoading() {
         </AvatarFallback>
       </Avatar>
       <div className="flex flex-col gap-1 py-2">
-        <div className="flex items-center gap-2">
-          <Spinner className="size-3 text-muted-foreground" />
-          <span className="text-sm text-muted-foreground font-medium">
-            Agent is thinking...
-          </span>
-        </div>
-        <div className="flex gap-1">
-          <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground/40 animate-pulse" style={{ animationDelay: '0ms' }} />
-          <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground/40 animate-pulse" style={{ animationDelay: '150ms' }} />
-          <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground/40 animate-pulse" style={{ animationDelay: '300ms' }} />
-        </div>
+        <span className="text-sm text-muted-foreground font-medium">
+          Agent is thinking...
+        </span>
       </div>
     </div>
   );

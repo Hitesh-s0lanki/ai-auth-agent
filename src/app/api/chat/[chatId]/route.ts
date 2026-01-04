@@ -4,9 +4,7 @@ import {
   convertToModelMessages,
   stepCountIs,
   Output,
-  JSONValue,
 } from "ai";
-import type { ToolResultPart } from "@ai-sdk/provider-utils";
 import { openai } from "@ai-sdk/openai";
 import { weatherTool } from "@/lib/tools/weather";
 import { emailValidatorTool } from "@/lib/tools/email-validator";
@@ -17,7 +15,7 @@ import {
   verifyChatOwnership,
   updateChatTimestamp,
   deleteChat,
-  generateChatTitleWithAI,
+  // generateChatTitleWithAI,
 } from "@/modules/chat/server";
 import { saveMessage, getChatMessages } from "@/modules/messages/server";
 import { StreamStructuredSchema } from "@/modules/chat/schemas";
@@ -25,6 +23,7 @@ import { CHAT_AGENT } from "@/lib/system_prompts/chat-agent";
 import { createToolCall } from "@/modules/tools/server";
 import { ChatRequestBody } from "@/modules/chat/types";
 import type { ToolResultContentPart } from "@/modules/tools/types";
+import { validateToolCallId } from "@/lib/tool-call-id";
 
 /**
  * Type definitions for request body parsing
@@ -293,7 +292,6 @@ export async function POST(
       );
     }
 
-    // IMPORTANT: Chat must already exist - use POST /api/chat to create new chats
     if (chatId === "new") {
       return Response.json(
         {
@@ -315,10 +313,14 @@ export async function POST(
     }
 
     const bodyObj = body as ChatRequestPayload;
-    const query = extractQueryFromBody(body);
+    let query = extractQueryFromBody(body);
     const frontendToolCallRes = bodyObj?.frontendToolCallRes ?? null;
 
-    // Allow empty query if frontendToolCallRes is provided (tool result continuation)
+    // Tool continuation: if tool result present and user sent "continue", do not save that as a real user query
+    if (frontendToolCallRes && query === "continue") {
+      query = null;
+    }
+
     if (!query && !frontendToolCallRes) {
       return Response.json(
         {
@@ -330,7 +332,7 @@ export async function POST(
     }
 
     const validatedBody: ChatRequestBody = {
-      query: query || "", // Use empty string if no query but tool result exists
+      query: query || "", // empty string allowed when only tool result exists
       frontendToolCallRes,
     };
 
@@ -344,7 +346,6 @@ export async function POST(
       );
     }
 
-    // Verify ownership
     const verifyResult = await verifyChatOwnership(chatId, userId, sessionId);
     if (!verifyResult.success) {
       return Response.json(
@@ -353,7 +354,6 @@ export async function POST(
       );
     }
 
-    // Load existing messages
     const messagesResult = await getChatMessages(chatId, userId, sessionId);
     if (!messagesResult.success || !messagesResult.data) {
       return Response.json(
@@ -367,7 +367,7 @@ export async function POST(
       (m) => m.role === "user"
     ).length;
 
-    // Save user message ONLY if query exists (not for tool result only requests)
+    // Save user message ONLY if query exists (not for tool-only continuation)
     let saveUser: Awaited<ReturnType<typeof saveMessage>> | null = null;
     if (validatedBody.query && validatedBody.query.trim()) {
       saveUser = await saveMessage(
@@ -385,7 +385,7 @@ export async function POST(
       }
     }
 
-    // Convert database messages to AI SDK format
+    // Convert DB messages to model messages
     const agentMessages = await convertToModelMessages(
       dbMessages.map((msg) => ({
         id: msg.id,
@@ -394,11 +394,11 @@ export async function POST(
       }))
     );
 
-    // Inject user message only if query exists
+    // Inject user query if present
     if (validatedBody.query && validatedBody.query.trim()) {
-      // Inject authentication alert for unauthenticated users after 2 messages
-      // This alerts the AI agent that the user is not authenticated
       let user_query = validatedBody.query;
+
+      // Inject auth alert after 2 user messages if not logged in
       if (existingUserCount > 2 && !userId) {
         user_query +=
           "\n\n<<<<<====== Alert =======>>>>>>>>>\nUser is not Authenticated\n<<<<<====== Alert =======>>>>>>>>>";
@@ -407,26 +407,31 @@ export async function POST(
       agentMessages.push({ role: "user", content: user_query });
     }
 
-    // Inject tool call result from frontend if provided
-    // This allows the AI to continue the conversation after a tool call
+    /**
+     * ✅ Frontend tool results:
+     * Keep as USER context (not tool role) to avoid OpenAI rejecting tool-result
+     * when there was no prior tool-call in OpenAI tool system.
+     *
+     * This formatting is deterministic for the prompt to parse.
+     */
     if (validatedBody.frontendToolCallRes) {
       const toolResult = validatedBody.frontendToolCallRes;
 
-      const toolContent: ToolResultPart[] = [
-        {
-          type: "tool-result",
-          toolCallId: toolResult.toolCallId,
-          toolName: toolResult.toolName,
-          output:
-            toolResult.output.type === "json"
-              ? { type: "json", value: toolResult.output.value as JSONValue }
-              : { type: "text", value: String(toolResult.output.value) },
-        },
-      ];
+      const toolResultText =
+        toolResult.output.type === "json"
+          ? JSON.stringify(toolResult.output.value, null, 2)
+          : String(toolResult.output.value);
+
+      const toolContextMessage =
+        `[FRONTEND_TOOL_RESULT]\n` +
+        `toolName=${toolResult.toolName}\n` +
+        `toolCallId=${toolResult.toolCallId}\n` +
+        `output=${toolResultText}\n` +
+        `[/FRONTEND_TOOL_RESULT]`;
 
       agentMessages.push({
-        role: "tool",
-        content: toolContent,
+        role: "user",
+        content: toolContextMessage,
       });
     }
 
@@ -441,36 +446,73 @@ export async function POST(
       output: Output.object({ schema: StreamStructuredSchema }),
       stopWhen: stepCountIs(10),
 
-      /**
-       * Callback executed when the AI stream finishes.
-       * Saves the assistant message, tool calls, and generates chat title if needed.
-       */
       onFinish: async ({ text, steps }) => {
-        // Get the parent message ID (user message if exists, otherwise null for tool-only requests)
         const parentMessageId =
           saveUser && saveUser.success ? saveUser.data.id : null;
 
-        // Save the assistant's response
+        // Parse structured response if model returned JSON string
+        let structured: {
+          result?: string;
+          frontend_tool_call?: {
+            tool_name: string;
+            tool_args: Record<string, unknown>;
+          } | null;
+        } | null = null;
+
+        try {
+          structured = JSON.parse(text);
+        } catch {
+          structured = null;
+        }
+
+        const displayText =
+          structured?.result && typeof structured.result === "string"
+            ? structured.result
+            : text;
+
+        const assistantParts: UIMessage["parts"] = [
+          { type: "text", text: displayText },
+        ];
+
+        // Only store structured data in object format if it contains frontend_tool_call
+        // This prevents duplicate content in the database
+        if (
+          structured &&
+          typeof structured === "object" &&
+          structured.frontend_tool_call
+        ) {
+          assistantParts.push({
+            type: "object",
+            object: structured,
+          } as unknown as UIMessage["parts"][number]);
+        }
+
         const saveAssistant = await saveMessage(
           chatId,
           "assistant",
-          text,
-          [{ type: "text", text }],
+          displayText,
+          assistantParts,
           parentMessageId
         );
-        if (!saveAssistant.success) throw new Error(saveAssistant.error);
 
-        // Save frontend tool call result to database if provided
+        if (!saveAssistant.success) {
+          throw new Error(saveAssistant.error);
+        }
+
+        // Save frontend tool call result to DB if provided
         if (validatedBody.frontendToolCallRes) {
           const toolResult = validatedBody.frontendToolCallRes;
           const createdAtForFrontendTool = new Date();
 
           try {
+            const validatedToolCallId = validateToolCallId(
+              toolResult.toolCallId
+            );
             await createToolCall(
               saveAssistant.data.id,
-              toolResult.toolCallId,
+              validatedToolCallId,
               toolResult.toolName,
-              {}, // Frontend tools don't have input args stored separately
+              {}, // frontend tools: input not stored
               toolResult.output.type === "json"
                 ? (toolResult.output.value as Record<string, unknown>)
                 : { value: toolResult.output.value },
@@ -478,18 +520,18 @@ export async function POST(
             );
           } catch (err) {
             console.error("Error saving frontend tool call:", err);
-            // Don't throw - continue with other tool calls
           }
         }
 
-        // Save all server-side tool calls that were executed during the conversation
+        // Save server-side tool calls executed by the model
         const createdAtForToolCalls = new Date();
         for (const step of steps) {
           for (const item of step.content) {
             if (item.type === "tool-result") {
+              const validatedToolCallId = validateToolCallId(item.toolCallId);
               createToolCall(
                 saveAssistant.data.id,
-                item.toolCallId,
+                validatedToolCallId,
                 item.toolName,
                 item.input as Record<string, unknown>,
                 item.output as Record<string, unknown>,
@@ -499,24 +541,23 @@ export async function POST(
           }
         }
 
-        // Update chat's last modified timestamp
         await updateChatTimestamp(chatId);
 
-        // Generate chat title after the FIRST user message
-        // existingUserCount === 0 means this was the first message in the chat
-        // Only generate if there was a user query (not tool-only request)
-        if (
-          existingUserCount === 0 &&
-          validatedBody.query &&
-          validatedBody.query.trim()
-        ) {
-          await generateChatTitleWithAI(
-            validatedBody.query,
-            chatId,
-            userId,
-            sessionId
-          );
-        }
+        // Generate title only after first user message
+        // if (
+        //   messagesResult.data.filter((m) => m.role === "user").length === 1 &&
+        //   validatedBody.query &&
+        //   validatedBody.query.trim()
+        // ) {
+        //   await generateChatTitleWithAI(
+        //     messagesResult.data.map((m) => m.content).join("\n") +
+        //       "\n" +
+        //       validatedBody.query,
+        //     chatId,
+        //     userId,
+        //     sessionId
+        //   );
+        // }
       },
     });
 

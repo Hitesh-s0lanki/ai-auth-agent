@@ -7,7 +7,14 @@ export class AxiosChatTransport extends DefaultChatTransport<UIMessage> {
   constructor(config: { api: string; body?: () => Partial<ChatRequestBody> }) {
     super({
       api: config.api,
-      body: config.body ?? (() => ({ frontendToolCallRes: null })),
+      body: config.body
+        ? () => {
+            const bodyData = config.body!();
+            return bodyData;
+          }
+        : () => {
+            return { frontendToolCallRes: null };
+          },
     });
   }
 }

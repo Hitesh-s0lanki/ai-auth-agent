@@ -2,7 +2,7 @@
 
 import { useChat } from "@ai-sdk/react";
 import type { UIMessage } from "ai";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
 import axios from "axios";
 
@@ -18,19 +18,98 @@ import {
 } from "@/lib/streaming-middleware";
 import { useChatFrontendTools } from "@/hooks/use-chat-frontend-tools";
 import type { ToolResultContentPart } from "@/modules/tools/types";
+import { generateToolCallId } from "@/lib/tool-call-id";
 
-/**
- * Chat page component - displays and manages an existing chat session.
- *
- * Features:
- * - Loads chat history from API
- * - Auto-sends first message from query param (for new chats)
- * - Streams AI responses using useChat hook
- * - Updates chat metadata (lastMessage, updatedAt) in sidebar
- * - Handles tool calls and frontend tool call results
- *
- * @returns Chat interface with message history and input
- */
+// ─────────────────────────────────────────────────────────────
+// Type guards
+type TextUIPart = { type: "text"; text: string };
+
+function isTextPart(part: unknown): part is TextUIPart {
+  return (
+    typeof part === "object" &&
+    part !== null &&
+    "type" in part &&
+    (part as { type: unknown }).type === "text" &&
+    "text" in part &&
+    typeof (part as { text: unknown }).text === "string"
+  );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+type Structured = {
+  result?: string;
+  frontend_tool_call?: {
+    tool_name: string;
+    tool_args: Record<string, unknown>;
+  } | null;
+};
+
+function extractStructuredFromAssistant(msg: UIMessage): Structured | null {
+  // 1) Prefer structured parts
+  for (const part of msg.parts) {
+    const partRecord = part as Record<string, unknown>;
+
+    if (partRecord.type === "data" && "data" in partRecord) {
+      const data = partRecord.data;
+      if (isRecord(data)) return data as Structured;
+    }
+
+    if (partRecord.type === "object" && "object" in partRecord) {
+      const obj = partRecord.object;
+      if (isRecord(obj)) return obj as Structured;
+    }
+  }
+
+  // 2) Fallback: parse JSON from text
+  const textPart = msg.parts.find(isTextPart);
+  const raw = textPart?.text ?? "";
+  const trimmed = String(raw).trim();
+  if (!trimmed.includes("{")) return null;
+
+  let startIdx = 0;
+  let firstValid: Structured | null = null;
+
+  while (startIdx < trimmed.length) {
+    const braceStart = trimmed.indexOf("{", startIdx);
+    if (braceStart === -1) break;
+
+    let braceCount = 0;
+    let braceEnd = -1;
+    for (let i = braceStart; i < trimmed.length; i++) {
+      if (trimmed[i] === "{") braceCount++;
+      if (trimmed[i] === "}") {
+        braceCount--;
+        if (braceCount === 0) {
+          braceEnd = i;
+          break;
+        }
+      }
+    }
+    if (braceEnd === -1) break;
+
+    try {
+      const jsonStr = trimmed.slice(braceStart, braceEnd + 1);
+      const parsed = JSON.parse(jsonStr);
+      if (parsed && typeof parsed === "object") {
+        const typed = parsed as Structured;
+        if (typed.frontend_tool_call) return typed;
+        if (!firstValid) firstValid = typed;
+      }
+    } catch {
+      // continue
+    }
+
+    startIdx = braceEnd + 1;
+  }
+
+  return firstValid;
+}
+
+// ─────────────────────────────────────────────────────────────
+
 export default function ChatPage() {
   const router = useRouter();
   const params = useParams();
@@ -43,260 +122,284 @@ export default function ChatPage() {
   const [isLoading, setIsLoading] = useState(true);
   const [hasSentFirstMessage, setHasSentFirstMessage] = useState(false);
 
-  // Refs to prevent side effects during initialization
-  const isInitializingRef = useRef(false); // Prevents updateChat effects while setting initial messages
-  const lastUpdatedRef = useRef<string>(""); // Tracks last updated message to prevent duplicate updates
-  const hasLoadedMessagesRef = useRef(false); // Ensures messages are only loaded once
+  const isInitializingRef = useRef(false);
+  const lastUpdatedRef = useRef<string>("");
+  const hasLoadedMessagesRef = useRef(false);
 
-  // Frontend tools for Clerk authentication
   const { tools: frontendTools, CaptchaSlot } = useChatFrontendTools();
 
-  // Track pending tool calls to avoid duplicate executions
-  const pendingToolCallsRef = useRef<Set<string>>(new Set());
-  // Track which messages we've already processed for tool calls
-  const processedMessagesRef = useRef<Set<string>>(new Set());
-  const [pendingToolCallRes, setPendingToolCallRes] =
-    useState<ToolResultContentPart | null>(null);
+  // Tool execution tracking
+  const processedAssistantIdsRef = useRef<Set<string>>(new Set()); // assistant ids already handled
+  const processedAssistantContentRef = useRef<Set<string>>(new Set()); // assistant content hashes already handled
+  const inFlightToolForAssistantRef = useRef<string | null>(null); // avoid multiple exec while streaming updates
+  const pendingToolCallResRef = useRef<ToolResultContentPart | null>(null);
+  const isSendingToolResultRef = useRef(false);
+
+  // ✅ Hide internal "continue" user messages
+  const hideNextContinueRef = useRef(false);
+  const hiddenUserMessageIdsRef = useRef<Set<string>>(new Set());
+
+  // ✅ Gate: allow auto tool execution only if we *just streamed* in this tab
+  const lastStatusRef = useRef<string>("ready");
+
+  // ✅ A "tool continuation" should only ever send once per tool call id
+  const sentContinuationForToolCallRef = useRef<Set<string>>(new Set());
 
   const transport = useMemo(
     () =>
       new AxiosChatTransport({
         api: `/api/chat/${chatId}`,
-        body: () => ({
-          frontendToolCallRes: pendingToolCallRes,
-        } as Partial<ChatRequestBody>),
+        body: () => {
+          return {
+            frontendToolCallRes: pendingToolCallResRef.current,
+          } as Partial<ChatRequestBody>;
+        },
       }),
-    [chatId, pendingToolCallRes]
+    [chatId]
   );
 
   const { messages, setMessages, sendMessage, status, stop, error } = useChat({
     transport,
   });
 
-  /**
-   * Define streaming middleware functions
-   * Add your middleware functions here to process streaming text
-   *
-   * Middleware is applied to all streaming text chunks on the client side.
-   * Each middleware function receives:
-   * - text: The current text chunk
-   * - context: { messageId, role, isStreaming, accumulatedText }
-   *
-   * Example usage:
-   * ```ts
-   * import { wordReplacementMiddleware } from "@/lib/middleware-examples";
-   *
-   * const streamingMiddleware: StreamingMiddleware[] = [
-   *   wordReplacementMiddleware,
-   *   // Add more middleware here
-   * ];
-   * ```
-   *
-   * Or define inline:
-   * ```ts
-   * const customMiddleware: StreamingMiddleware = (text, context) => {
-   *   if (context.role === "assistant" && context.isStreaming) {
-   *     // Your transformation logic
-   *     return text.replace(/pattern/g, "replacement");
-   *   }
-   *   return text;
-   * };
-   * ```
-   */
-  const streamingMiddleware: StreamingMiddleware[] = useMemo(() => {
-    // Add your middleware functions here
-    // They will be applied in order to each streaming text chunk
-    //
-    // Example: Import from middleware-examples.ts
-    // import { wordReplacementMiddleware, sanitizeMiddleware } from "@/lib/middleware-examples";
-    // return [wordReplacementMiddleware, sanitizeMiddleware];
+  const streamingMiddleware: StreamingMiddleware[] = useMemo(() => [], []);
 
-    return [
-      // Add your middleware functions here
-      // Example inline middleware:
-      // (text, context) => {
-      //   // Only apply to assistant messages during streaming
-      //   if (context.role === "assistant" && context.isStreaming) {
-      //     // Your transformation logic here
-      //     return text;
-      //   }
-      //   return text;
-      // },
-    ];
-  }, []);
-
-  // Apply middleware to messages before rendering
+  // Apply middleware and also filter hidden internal messages
   const processedMessages = useMemo(() => {
     const isStreaming = status === "streaming" || status === "submitted";
-    return applyStreamingMiddleware(messages, streamingMiddleware, isStreaming);
+    const afterMiddleware = applyStreamingMiddleware(
+      messages,
+      streamingMiddleware,
+      isStreaming
+    );
+
+    // ✅ Filter internal continue messages by id
+    const withoutHidden = afterMiddleware.filter(
+      (m) => !hiddenUserMessageIdsRef.current.has(m.id)
+    );
+
+    // ✅ Deduplicate messages: by ID first, then by content for assistant messages
+    const seenIds = new Set<string>();
+    const seenContentHashes = new Set<string>();
+    const deduplicated: UIMessage[] = [];
+
+    for (const msg of withoutHidden) {
+      // Always deduplicate by ID
+      if (seenIds.has(msg.id)) {
+        continue;
+      }
+      seenIds.add(msg.id);
+
+      // For assistant messages, also deduplicate by content to catch duplicates with different IDs
+      if (msg.role === "assistant") {
+        const textPart = msg.parts.find(isTextPart);
+        const content = textPart?.text ?? "";
+        const contentHash = `${msg.role}:${content.slice(0, 200)}`; // Use first 200 chars as hash
+
+        if (seenContentHashes.has(contentHash)) {
+          continue;
+        }
+        seenContentHashes.add(contentHash);
+      }
+
+      deduplicated.push(msg);
+    }
+
+    return deduplicated;
   }, [messages, streamingMiddleware, status]);
 
+  // Detect the next user message id for "continue" and hide it
+  useEffect(() => {
+    if (!hideNextContinueRef.current) return;
+    if (!messages.length) return;
+
+    const last = messages[messages.length - 1];
+    if (last.role !== "user") return;
+
+    const textPart = last.parts.find(isTextPart);
+    const text = (textPart?.text ?? "").trim();
+
+    if (text === "__internal_continue__") {
+      hiddenUserMessageIdsRef.current.add(last.id);
+      hideNextContinueRef.current = false;
+    }
+  }, [messages]);
+
+  const executeFrontendToolCall = useCallback(
+    async (opts: {
+      assistantMessageId: string;
+      toolName: string;
+      toolArgs: Record<string, unknown>;
+    }) => {
+      if (!frontendTools) throw new Error("frontendTools not loaded");
+
+      const { assistantMessageId, toolName, toolArgs } = opts;
+
+      const tool = frontendTools[toolName as keyof typeof frontendTools];
+      if (!tool || typeof tool !== "object" || !("execute" in tool)) {
+        throw new Error(
+          `Frontend tool "${toolName}" not found. Available tools: ${Object.keys(
+            frontendTools
+          ).join(", ")}`
+        );
+      }
+
+      let finalArgs: unknown = toolArgs;
+
+      type ToolWithParameters = {
+        parameters?: { parse: (args: unknown) => unknown };
+        execute: (args: never) => Promise<unknown>;
+      };
+
+      const toolWithParams = tool as ToolWithParameters;
+      if (toolWithParams?.parameters?.parse) {
+        finalArgs = toolWithParams.parameters.parse(toolArgs);
+      }
+
+      const toolCallId = generateToolCallId(
+        "frontend",
+        toolName,
+        assistantMessageId
+      );
+
+      // ✅ Ensure we do not send the continuation multiple times for the same tool call
+      if (sentContinuationForToolCallRef.current.has(toolCallId)) return;
+      sentContinuationForToolCallRef.current.add(toolCallId);
+
+      const result = await toolWithParams.execute(finalArgs as never);
+
+      const toolResult: ToolResultContentPart = {
+        type: "tool-result",
+        toolCallId,
+        toolName,
+        output: { type: "json", value: result },
+      };
+
+      // Send tool result in next request
+      pendingToolCallResRef.current = toolResult;
+      isSendingToolResultRef.current = true;
+
+      // ✅ Hide the internal continue message in UI
+      hideNextContinueRef.current = true;
+
+      // Use a special internal marker text (not "continue") and hide it
+      sendMessage({ text: "__internal_continue__" });
+
+      // Cleanup
+      setTimeout(() => {
+        pendingToolCallResRef.current = null;
+        isSendingToolResultRef.current = false;
+        inFlightToolForAssistantRef.current = null;
+      }, 500);
+    },
+    [frontendTools, sendMessage]
+  );
+
   /**
-   * Handle frontend tool calls from streamed messages
-   * Detects tool calls in structured output and executes them
-   * This runs whenever messages change during streaming
+   * ✅ Auto-run frontend_tool_call ONLY for live-streaming in this tab.
+   * - Allowed during streaming/submitted, OR immediately when streaming just finished.
+   * - Not allowed on refresh (ready → ready)
    */
   useEffect(() => {
-    // Only process during streaming, not when ready
-    if (!frontendTools || status === "ready" || !messages.length) {
+    if (!frontendTools || !messages.length) {
+      lastStatusRef.current = status;
+      return;
+    }
+    if (isSendingToolResultRef.current) {
+      lastStatusRef.current = status;
       return;
     }
 
-    // Find the last assistant message with structured output
-    const lastAssistantMessage = [...messages]
+    const prev = lastStatusRef.current;
+    const isLive = status === "streaming" || status === "submitted";
+    const justFinished =
+      (prev === "streaming" || prev === "submitted") && status === "ready";
+
+    const canAutoRun = isLive || justFinished;
+
+    // ✅ Prevent refresh from running tools (ready -> ready)
+    if (!canAutoRun) {
+      lastStatusRef.current = status;
+      return;
+    }
+
+    const lastAssistant = [...messages]
       .reverse()
-      .find((msg) => msg.role === "assistant");
-
-    if (!lastAssistantMessage) return;
-
-    // Skip if we've already processed this message
-    if (processedMessagesRef.current.has(lastAssistantMessage.id)) {
+      .find((m) => m.role === "assistant");
+    if (!lastAssistant) {
+      lastStatusRef.current = status;
       return;
     }
 
-    // Check for structured output with frontend_tool_call
-    // TypeScript doesn't recognize "object" as a valid part type, so we use type assertion
-    let foundToolCall = false;
-    for (const part of lastAssistantMessage.parts) {
-      const partRecord = part as Record<string, unknown>;
-      if (
-        typeof part === "object" &&
-        part !== null &&
-        "type" in partRecord &&
-        partRecord.type === "object" &&
-        "object" in partRecord &&
-        typeof partRecord.object === "object" &&
-        partRecord.object !== null
-      ) {
-        const obj = partRecord.object as Record<string, unknown>;
-        const frontendToolCall = obj.frontend_tool_call as
-          | {
-              tool_name: string;
-              tool_args: Record<string, unknown>;
-            }
-          | null
-          | undefined;
+    // ✅ Already handled this assistant message by ID
+    if (processedAssistantIdsRef.current.has(lastAssistant.id)) {
+      lastStatusRef.current = status;
+      return;
+    }
 
-        if (frontendToolCall && frontendToolCall.tool_name) {
-          foundToolCall = true;
-          
-          // Create a stable tool call ID based on message and tool name
-          const toolCallId = `frontend-${frontendToolCall.tool_name}-${lastAssistantMessage.id}`;
+    // ✅ Also check by content hash to prevent duplicate processing of same content with different IDs
+    const textPart = lastAssistant.parts.find(isTextPart);
+    const content = textPart?.text ?? "";
+    const contentHash = `${lastAssistant.role}:${content.slice(0, 200)}`;
+    if (processedAssistantContentRef.current.has(contentHash)) {
+      lastStatusRef.current = status;
+      return;
+    }
 
-          // Skip if already processing this tool call
-          if (pendingToolCallsRef.current.has(toolCallId)) {
-            continue;
-          }
+    // ✅ Avoid re-entry while parts are still changing rapidly during stream
+    if (inFlightToolForAssistantRef.current === lastAssistant.id) {
+      lastStatusRef.current = status;
+      return;
+    }
 
-          pendingToolCallsRef.current.add(toolCallId);
+    const structured = extractStructuredFromAssistant(lastAssistant);
+    const ftc = structured?.frontend_tool_call ?? null;
 
-          // Execute the frontend tool asynchronously
-          const executeTool = async () => {
-            try {
-              const toolName = frontendToolCall.tool_name;
-              const tool = frontendTools[toolName as keyof typeof frontendTools];
-
-              if (!tool || typeof tool !== "object" || !("execute" in tool)) {
-                throw new Error(
-                  `Frontend tool "${toolName}" not found. Available tools: ${Object.keys(frontendTools).join(", ")}`
-                );
-              }
-
-              // Validate and prepare arguments using zod schema if available
-              let toolArgs: unknown = frontendToolCall.tool_args;
-              if (tool.parameters && "parse" in tool.parameters) {
-                try {
-                  toolArgs = tool.parameters.parse(frontendToolCall.tool_args);
-                } catch (parseErr) {
-                  throw new Error(
-                    `Invalid arguments for ${toolName}: ${
-                      parseErr instanceof Error ? parseErr.message : "Validation failed"
-                    }`
-                  );
-                }
-              }
-
-              // Execute the tool
-              const result = await tool.execute(toolArgs as never);
-
-              // Format result for API
-              const toolResult: ToolResultContentPart = {
-                type: "tool-result",
-                toolCallId,
-                toolName,
-                output: {
-                  type: "json",
-                  value: result,
-                },
-              };
-
-              setPendingToolCallRes(toolResult);
-
-              // Automatically continue the conversation by sending a continuation message
-              // This will trigger the API to process the tool result
-              // Use a small delay to ensure state is updated
-              setTimeout(() => {
-                sendMessage({ text: "continue" });
-                // Clear after a delay to ensure it's sent
-                setTimeout(() => {
-                  setPendingToolCallRes(null);
-                  pendingToolCallsRef.current.delete(toolCallId);
-                }, 1000);
-              }, 200);
-            } catch (err) {
-              console.error("Frontend tool execution error:", err);
-
-              // Send error result back to API
-              const errorMessage =
-                err instanceof Error
-                  ? err.message
-                  : "An unknown error occurred while executing the tool";
-
-              const errorResult: ToolResultContentPart = {
-                type: "tool-result",
-                toolCallId,
-                toolName: frontendToolCall.tool_name,
-                output: {
-                  type: "text",
-                  value: `Error: ${errorMessage}`,
-                },
-              };
-
-              setPendingToolCallRes(errorResult);
-
-              // Continue conversation with error
-              setTimeout(() => {
-                sendMessage({ text: "continue" });
-                setTimeout(() => {
-                  setPendingToolCallRes(null);
-                  pendingToolCallsRef.current.delete(toolCallId);
-                }, 1000);
-              }, 200);
-            }
-          };
-
-          // Execute immediately
-          void executeTool();
-        }
+    if (!ftc?.tool_name) {
+      // Only mark as processed after stream finishes
+      if (status === "ready") {
+        processedAssistantIdsRef.current.add(lastAssistant.id);
+        processedAssistantContentRef.current.add(contentHash);
       }
+      lastStatusRef.current = status;
+      return;
     }
 
-    // Mark message as processed if we found a tool call or if there's no tool call
-    if (lastAssistantMessage && (foundToolCall || lastAssistantMessage.parts.length > 0)) {
-      processedMessagesRef.current.add(lastAssistantMessage.id);
-    }
-  }, [messages, frontendTools, status, sendMessage]);
+    // ✅ We have a tool call. Execute exactly once.
+    inFlightToolForAssistantRef.current = lastAssistant.id;
+    processedAssistantIdsRef.current.add(lastAssistant.id);
+    processedAssistantContentRef.current.add(contentHash);
+
+    void executeFrontendToolCall({
+      assistantMessageId: lastAssistant.id,
+      toolName: ftc.tool_name,
+      toolArgs: ftc.tool_args,
+    }).catch((err) => {
+      console.error("[Frontend Tools] execution failed:", err);
+      inFlightToolForAssistantRef.current = null;
+    });
+
+    lastStatusRef.current = status;
+  }, [
+    messages,
+    frontendTools,
+    status,
+    sendMessage,
+    processedAssistantIdsRef,
+    inFlightToolForAssistantRef,
+    lastStatusRef,
+    executeFrontendToolCall,
+  ]);
 
   /**
-   * Load chat message history from API.
-   * Skips loading if there's a first message in query params (new chat scenario).
+   * Load chat history from API.
+   * Note: We DO NOT auto-run tool calls on load (refresh-safe).
    */
   useEffect(() => {
     if (hasLoadedMessagesRef.current) return;
 
     const firstMessage = searchParams.get("message");
     if (firstMessage) {
-      // For new chats with first message, don't load messages - let useChat handle the optimistic update
       setIsLoading(false);
       hasLoadedMessagesRef.current = true;
       return;
@@ -327,6 +430,7 @@ export default function ChatPage() {
         queueMicrotask(() => {
           isInitializingRef.current = false;
         });
+
         hasLoadedMessagesRef.current = true;
       } catch (err) {
         console.error("Load chat failed:", err);
@@ -341,12 +445,11 @@ export default function ChatPage() {
       }
     };
 
-    if (chatId) load();
+    if (chatId) void load();
   }, [chatId, router, setMessages, searchParams]);
 
   /**
-   * Auto-send first message from URL query parameter.
-   * This is used when creating a new chat from the home page.
+   * Auto-send first message from URL query param.
    */
   useEffect(() => {
     if (!chatId) return;
@@ -363,7 +466,6 @@ export default function ChatPage() {
     setHasSentFirstMessage(true);
     sendMessage({ text: decodedMessage });
 
-    // Clean up URL by removing the message param
     const newSearchParams = new URLSearchParams(searchParams.toString());
     newSearchParams.delete("message");
     const newSearch = newSearchParams.toString();
@@ -380,9 +482,7 @@ export default function ChatPage() {
   ]);
 
   /**
-   * Update chat metadata (lastMessage, updatedAt) in sidebar when messages change.
-   * Uses deduplication to prevent unnecessary updates.
-   * Note: Uses processedMessages to get the final text after middleware
+   * Update sidebar metadata
    */
   useEffect(() => {
     if (!chatId) return;
@@ -390,16 +490,16 @@ export default function ChatPage() {
     if (processedMessages.length === 0) return;
 
     const last = processedMessages[processedMessages.length - 1];
-    const textPart = last.parts.find((p) => p.type === "text");
-    const lastText = textPart && "text" in textPart ? textPart.text : "";
-    const key = `${last.id}:${lastText.slice(0, 60)}`;
+    const textPart = last.parts.find(isTextPart);
+    const lastText = textPart?.text ?? "";
+    const key = `${last.id}:${String(lastText).slice(0, 60)}`;
 
     if (key === lastUpdatedRef.current) return;
     lastUpdatedRef.current = key;
 
     const t = setTimeout(() => {
       updateChat(chatId, {
-        lastMessage: lastText.slice(0, 50),
+        lastMessage: String(lastText).slice(0, 50),
         updatedAt: new Date(),
       });
     }, 150);
@@ -407,12 +507,16 @@ export default function ChatPage() {
     return () => clearTimeout(t);
   }, [chatId, processedMessages, updateChat]);
 
+  /**
+   * User submit.
+   * Also blocks sending while tool continuation is in progress to prevent double-post storms.
+   */
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-
     const text = input.trim();
     if (!text) return;
     if (status !== "ready") return;
+    if (isSendingToolResultRef.current) return; // ✅ prevent spam during tool continuation
 
     setInput("");
     sendMessage({ text });
