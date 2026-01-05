@@ -24,6 +24,7 @@ import { createToolCall } from "@/modules/tools/server";
 import { ChatRequestBody } from "@/modules/chat/types";
 import type { ToolResultContentPart } from "@/modules/tools/types";
 import { validateToolCallId } from "@/lib/tool-call-id";
+import { AUTH_ALERT_MESSAGE_THRESHOLD } from "@/lib/constants";
 
 /**
  * Type definitions for request body parsing
@@ -398,8 +399,8 @@ export async function POST(
     if (validatedBody.query && validatedBody.query.trim()) {
       let user_query = validatedBody.query;
 
-      // Inject auth alert after 2 user messages if not logged in
-      if (existingUserCount > 2 && !userId) {
+      // Inject auth alert after threshold number of user messages if not logged in
+      if (existingUserCount >= AUTH_ALERT_MESSAGE_THRESHOLD && !userId) {
         user_query +=
           "\n\n<<<<<====== Alert =======>>>>>>>>>\nUser is not Authenticated\n<<<<<====== Alert =======>>>>>>>>>";
       }
